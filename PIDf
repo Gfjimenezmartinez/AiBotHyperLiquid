@@ -1,0 +1,211 @@
+# =============================================
+# HYPERLIQUID PID TRADING BOT WITH CROSS CONFIRMATION
+# =============================================
+# pip install ccxt python-dotenv pandas numpy
+
+import ccxt
+import os
+import pandas as pd
+import numpy as np
+from dotenv import load_dotenv
+from time import sleep
+
+# ======================
+# 1. AUTHENTICATION 
+# ======================
+load_dotenv()
+hyperliquid = ccxt.hyperliquid({
+    "walletAddress": os.getenv("WALLET_ADDRESS"),
+    "privateKey": os.getenv("PRIVATE_KEY"), 
+    "enableRateLimit": True,
+    "options": {"defaultType": "swap"}
+})
+
+try:
+    hyperliquid.load_markets()
+    print("✓ Connected to Hyperliquid")
+except Exception as e:
+    print(f"Connection failed: {e}")
+    exit()
+
+# ======================
+# 2. TRADING SETUP
+# ======================
+SYMBOL = "ETH/USDC:USDC"
+TRADE_SIZE_USD = 50       # Risk per trade
+LEVERAGE = 2
+EMA_FAST = 10             # Short-term EMA (sensitive)
+EMA_SLOW = 50             # Long-term EMA (stable)
+CONFIRMATION_CANDLES = 3  # Candles for trend confirmation  
+MIN_SLOPE_DEGREES = 5     # Minimum trend angle in degrees
+TREND_CONFIRMATION = True # Toggle cross confirmation
+
+# Configure account
+hyperliquid.set_margin_mode("cross", SYMBOL)
+hyperliquid.set_leverage(LEVERAGE, SYMBOL)
+
+# ======================
+# 3. CORE FUNCTIONS
+# ======================
+def get_market_data():
+    """Fetch current price and historical data"""
+    try:
+        # Get recent candles for EMA calculation
+        candles = hyperliquid.fetch_ohlcv(SYMBOL, '5m', limit=100)
+        df = pd.DataFrame(candles, columns=['time', 'open', 'high', 'low', 'close', 'volume'])
+        current_price = (df['close'].iloc[-1] + df['open'].iloc[-1])/2
+        return df, current_price
+    except Exception as e:
+        print(f"Data fetch error: {e}")
+        return None, None
+
+def calculate_emas(df):
+    """Compute fast and slow EMAs"""
+    df['ema_fast'] = df['close'].ewm(span=EMA_FAST, adjust=False).mean()
+    df['ema_slow'] = df['close'].ewm(span=EMA_SLOW, adjust=False).mean() 
+    return df.iloc[-1]['ema_fast'], df.iloc[-1]['ema_slow']
+
+# ======================
+# 4. ENHANCED PID CONTROLLER
+# ======================
+class PIDController:
+    def __init__(self):
+        self.k_p = 0.8    # Proportional (reacts to current error)
+        self.k_i = 0.1    # Integral (corrects persistent bias)
+        self.k_d = 0.05   # Derivative (predicts future error)
+        self.prev_error = 0
+        self.integral = 0
+        self.last_trade = None
+        self.ema_fast_history = []
+        self.ema_slow_history = []
+        self.confirmed_trend = None
+        
+    def compute_signal(self, fast_ema, slow_ema):
+        """Calculate PID output from EMA crossover"""
+        error = fast_ema - slow_ema
+        
+        # PID terms
+        P = self.k_p * error
+        self.integral += error
+        I = self.k_i * self.integral
+        D = self.k_d * (error - self.prev_error)
+        
+        self.prev_error = error
+        return P + I + D  # Total control signal
+    
+    def check_trend_confirmation(self, current_fast, current_slow):
+        """Verify Golden/Death Cross with trend strength"""
+        # Update history buffers
+        self.ema_fast_history.append(current_fast)
+        self.ema_slow_history.append(current_slow)
+        self.ema_fast_history = self.ema_fast_history[-10:]
+        self.ema_slow_history = self.ema_slow_history[-10:]
+        
+        if len(self.ema_fast_history) < 2:
+            return False
+            
+        # Detect crossovers
+        golden_cross = (self.ema_fast_history[-2] < self.ema_slow_history[-2] and 
+                       self.ema_fast_history[-1] > self.ema_slow_history[-1])
+        death_cross = (self.ema_fast_history[-2] > self.ema_slow_history[-2] and 
+                      self.ema_fast_history[-1] < self.ema_slow_history[-1])
+        
+        # Check trend strength
+        if (golden_cross or death_cross) and len(self.ema_fast_history) >= CONFIRMATION_CANDLES:
+            x = np.arange(CONFIRMATION_CANDLES)
+            fast_slope = np.polyfit(x, self.ema_fast_history[-CONFIRMATION_CANDLES:], 1)[0]
+            fast_angle = np.degrees(np.arctan(fast_slope))
+            
+            if golden_cross and fast_angle > MIN_SLOPE_DEGREES:
+                self.confirmed_trend = "golden"
+                return True
+            elif death_cross and fast_angle < -MIN_SLOPE_DEGREES:
+                self.confirmed_trend = "death"
+                return True
+        return False
+    
+    def execute_trade(self, signal, current_price):
+        """Execute trade with cross confirmation"""
+        fast_ema, slow_ema = calculate_emas(get_market_data()[0])
+        confirmed = not TREND_CONFIRMATION or self.check_trend_confirmation(fast_ema, slow_ema)
+        
+        if (signal > 0.5 and self.last_trade != "buy" and 
+            (not TREND_CONFIRMATION or self.confirmed_trend == "golden")):
+            
+            amount = TRADE_SIZE_USD / current_price
+            hyperliquid.create_order(
+                symbol=SYMBOL,
+                type="market",
+                side="buy",
+                amount=round(amount, 4),
+                price=current_price,
+                params={"timeInForce": "IOC"}
+            )
+            self.last_trade = "buy"
+            status = f" (Confirmed Golden Cross)" if TREND_CONFIRMATION else ""
+            print(f"BUY SIGNAL: {signal:.2f}{status}")
+            
+        elif (signal < -0.5 and self.last_trade != "sell" and 
+              (not TREND_CONFIRMATION or self.confirmed_trend == "death")):
+            
+            amount = TRADE_SIZE_USD / current_price
+            hyperliquid.create_order(
+                symbol=SYMBOL,
+                type="market",
+                side="sell",
+                amount=round(amount, 4),
+                price=current_price,
+                params={"timeInForce": "IOC"}
+            )
+            self.last_trade = "sell"
+            status = f" (Confirmed Death Cross)" if TREND_CONFIRMATION else ""
+            print(f"SELL SIGNAL: {signal:.2f}{status}")
+
+# ======================
+# 5. TRADING LOOP
+# ======================
+def run_bot():
+    pid = PIDController()
+    
+    while True:
+        try:
+            # Get market data
+            df, current_price = get_market_data()
+            if df is None:
+                sleep(60)
+                continue
+                
+            # Calculate indicators
+            fast_ema, slow_ema = calculate_emas(df)
+            
+            # Generate PID signal
+            signal = pid.compute_signal(fast_ema, slow_ema)
+            
+            # Execute trade
+            pid.execute_trade(signal, current_price)
+            
+            # Status update
+            print("\n" + "="*50)
+            print(f"Price: {current_price:.2f}")
+            print(f"EMAs: Fast={fast_ema:.2f} | Slow={slow_ema:.2f}")
+            print(f"PID Signal: {signal:.2f}")
+            if TREND_CONFIRMATION and pid.confirmed_trend:
+                print(f"Trend Status: {pid.confirmed_trend.upper()}")
+            
+            sleep(300)  # Check every 5 minutes
+            
+        except KeyboardInterrupt:
+            print("\nBot stopped by user")
+            break
+        except Exception as e:
+            print(f"Error in main loop: {e}")
+            sleep(60)
+
+# ======================
+# 6. INITIALIZATION
+# ======================
+if __name__ == "__main__":
+    print("Starting Enhanced PID Trading Bot...")
+    print(f"Config: {EMA_FAST}/{EMA_SLOW} EMAs | ${TRADE_SIZE_USD} per trade | {LEVERAGE}x")
+    print(f"Trend Confirmation: {TREND_CONFIRMATION} (Slope: {MIN_SLOPE_DEGREES}°)")
+    run_bot()
