@@ -1,0 +1,47 @@
+# =============================================
+# HYPERLIQUID API AUTHENTICATION
+# =============================================
+# STEP 1: Install required package (run once)
+# !pip install ccxt python-dotenv
+
+import ccxt
+from dotenv import load_dotenv
+import os
+
+# ---------------------------------------------------
+# SECURITY NOTE: Never hardcode your private keys!
+# Create a .env file in your project folder with:
+# WALLET_ADDRESS=your_wallet_address_here
+# PRIVATE_KEY=your_private_key_here
+# ---------------------------------------------------
+
+# STEP 2: Load environment variables
+load_dotenv()  # Reads from .env file
+
+# STEP 3: Initialize Hyperliquid connection
+try:
+    dex = ccxt.hyperliquid({
+        "walletAddress": os.getenv("WALLET_ADDRESS"),  # From .env
+        "privateKey": os.getenv("PRIVATE_KEY"),       # From .env
+        "enableRateLimit": True,  # Required to prevent API bans
+        "options": {
+            "defaultType": "swap"  # For perpetual contracts
+        }
+    })
+    
+    # STEP 4: Test connection
+    dex.load_markets()  # Load available markets
+    print("✓ Successfully connected to Hyperliquid")
+    
+    # STEP 5: Verify account access
+    balance = dex.fetch_balance()
+    print(f"Available USDC: {balance['USDC']['free']}")
+    
+except Exception as e:
+    print(f"Connection failed: {str(e)}")
+    exit()
+
+# Now you're ready to trade!
+# Use 'dex' object for all API calls
+
+
